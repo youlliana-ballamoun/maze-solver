@@ -1,0 +1,331 @@
+#define ENA 4
+#define IN1 8
+#define IN2 9
+#define ENB 5
+#define IN3 10
+#define IN4 11
+
+#define LEFT_SENSOR   A0
+#define CENTER_SENSOR A1
+#define RIGHT_SENSOR  A2
+
+#define THRESHOLD 500
+
+int baseSpeed = 130;
+int turnSpeed = 110;
+int slowSpeed = 70;
+
+#define INTERSECTION_CONFIRM 6
+#define TURN_FORWARD_TIME 200
+
+#define BLE Serial1
+
+// sensor
+int leftRaw, centerRaw, rightRaw;
+bool onLeft, onCenter, onRight;
+
+// path
+char path[100];
+int pathLength = 0;
+int solveIndex = 0;
+
+// mode
+char mode = 'W'; // W=wait, E=explore, S=solve
+
+// state
+bool started = false;
+bool readyForCommand = false;
+bool leftStartCircle = false;   
+unsigned long blackStartTime = 0;
+
+int allBlackCount = 0;
+
+//  Setup
+void setup() {
+  pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  Serial.begin(9600);
+  BLE.begin(9600);
+
+  delay(2000);
+  BLE.println("POWER ON - PLACE ON START CIRCLE");
+}
+
+// Loop
+void loop() {
+
+  handleBluetooth();
+  readSensors();
+
+  // Wait for start circle
+  if (!readyForCommand) {
+
+    if (onLeft && onCenter && onRight) {
+
+      if (blackStartTime == 0)
+        blackStartTime = millis();
+
+      if (millis() - blackStartTime > 800) {
+        readyForCommand = true;
+        BLE.println("READY: SEND E OR S");
+      }
+    } else {
+      blackStartTime = 0;
+    }
+
+    stopMotors();
+    return;
+  }
+
+  
+  if (mode == 'W') return;
+
+  // Blackline detection
+  if (onLeft && onCenter && onRight) {
+
+    if (blackStartTime == 0)
+      blackStartTime = millis();
+
+    if (millis() - blackStartTime > 800) {
+
+      // ===== START =====
+      if (!started) {
+        started = true;
+        leftStartCircle = false; 
+        BLE.println("START DETECTED");
+
+        moveForward(slowSpeed, slowSpeed);
+        return;
+      }
+
+      // End
+      else if (leftStartCircle) {
+
+        stopMotors();
+        BLE.println("END DETECTED");
+
+        if (mode == 'E') {
+
+          BLE.println("\nRAW PATH:");
+          for (int i = 0; i < pathLength; i++) BLE.print(path[i]);
+
+          simplifyPath();
+
+          BLE.println("\nOPTIMIZED PATH:");
+          for (int i = 0; i < pathLength; i++) BLE.print(path[i]);
+
+          BLE.println("\n\nREADY FOR RUN 2");
+          BLE.println("PLACE ROBOT AT START AND PRESS S");
+        }
+
+        mode = 'W';
+        started = false;
+        readyForCommand = false;
+
+        return;
+      }
+    }
+  }
+  else {
+    blackStartTime = 0;
+  }
+
+  // ===== CRITICAL FIX: detect leaving start circle =====
+  if (started && !(onLeft && onCenter && onRight)) {
+    leftStartCircle = true;
+  }
+
+  if (!started) return;
+
+  // ===== INTERSECTION =====
+  if (onLeft && onCenter && onRight && (millis() - blackStartTime < 800)) {
+    allBlackCount++;
+
+    if (allBlackCount >= INTERSECTION_CONFIRM) {
+
+      if (mode == 'E') handleIntersectionExplore();
+      else handleIntersectionSolve();
+
+      allBlackCount = 0;
+      return;
+    }
+
+    moveForward(slowSpeed, slowSpeed);
+    return;
+  }
+  else {
+    allBlackCount = 0;
+  }
+
+  // ===== LOST =====
+  if (!onLeft && !onCenter && !onRight) {
+    recoverLine();
+    return;
+  }
+
+  // ===== FOLLOW =====
+  followLine();
+}
+
+// Bluetooth
+void handleBluetooth() {
+
+  static String command = "";
+
+  while (BLE.available()) {
+    char c = BLE.read();
+    if (c != '\n' && c != '\r' && c != ' ')
+      command += c;
+  }
+
+  if (command.length() == 0) return;
+
+  if (command == "E") {
+    mode = 'E';
+    resetState();
+    BLE.println("MODE: EXPLORE");
+  }
+
+  else if (command == "S") {
+
+    if (pathLength == 0) {
+      BLE.println("ERROR: NO PATH YET");
+    } else {
+      mode = 'S';
+      resetState();
+      solveIndex = 0;
+      BLE.println("MODE: SOLVE");
+    }
+  }
+
+  command = "";
+}
+
+// Reset 
+void resetState() {
+  started = false;
+  leftStartCircle = false;  
+  blackStartTime = 0;
+  allBlackCount = 0;
+}
+
+// Explore mode
+void handleIntersectionExplore() {
+  stopMotors();
+  delay(100);
+  readSensors();
+
+  if (onLeft) {
+    addMove('L');
+    doTurnLeft();
+  }
+  else if (onCenter) {
+    addMove('S');
+    moveForward(baseSpeed, baseSpeed);
+    delay(150);
+  }
+  else if (onRight) {
+    addMove('R');
+    doTurnRight();
+  }
+  else {
+    addMove('B');
+    doUTurn();
+  }
+
+  simplifyPath();
+}
+
+// Intersection handling
+void handleIntersectionSolve() {
+  stopMotors();
+  delay(100);
+
+  if (solveIndex >= pathLength) return;
+
+  char move = path[solveIndex++];
+  executeMove(move);
+}
+
+// Path
+void addMove(char m) {
+  path[pathLength++] = m;
+  BLE.print(m);
+}
+
+// Optimized path
+void simplifyPath() {
+  if (pathLength < 3) return;
+
+  int i = pathLength - 3;
+
+  if (path[i]=='L'&&path[i+1]=='B'&&path[i+2]=='R'){path[i]='B';pathLength-=2;}
+  else if (path[i]=='R'&&path[i+1]=='B'&&path[i+2]=='L'){path[i]='B';pathLength-=2;}
+  else if (path[i]=='L'&&path[i+1]=='B'&&path[i+2]=='L'){path[i]='S';pathLength-=2;}
+  else if (path[i]=='R'&&path[i+1]=='B'&&path[i+2]=='R'){path[i]='S';pathLength-=2;}
+}
+
+// Execute
+void executeMove(char move) {
+  if (move=='L') doTurnLeft();
+  else if (move=='R') doTurnRight();
+  else if (move=='S') {moveForward(baseSpeed, baseSpeed); delay(150);}
+  else if (move=='B') doUTurn();
+}
+
+// Follow
+void followLine() {
+  if (onCenter) moveForward(baseSpeed, baseSpeed);
+  else if (onLeft) moveForward(60, baseSpeed);
+  else if (onRight) moveForward(baseSpeed, 60);
+}
+
+// Sensors
+void readSensors() {
+  leftRaw   = analogRead(LEFT_SENSOR);
+  centerRaw = analogRead(CENTER_SENSOR);
+  rightRaw  = analogRead(RIGHT_SENSOR);
+
+  onLeft   = (leftRaw   < THRESHOLD);
+  onCenter = (centerRaw < THRESHOLD);
+  onRight  = (rightRaw  < THRESHOLD);
+}
+
+// Motors
+void moveForward(int L, int R) {
+  digitalWrite(IN1,HIGH);digitalWrite(IN2,LOW);
+  digitalWrite(IN3,HIGH);digitalWrite(IN4,LOW);
+  analogWrite(ENA,L);analogWrite(ENB,R);
+}
+
+void pivotRightMotors() {
+  digitalWrite(IN1,HIGH);digitalWrite(IN2,LOW);
+  digitalWrite(IN3,LOW);digitalWrite(IN4,HIGH);
+  analogWrite(ENA,turnSpeed);analogWrite(ENB,turnSpeed);
+}
+
+void pivotLeftMotors() {
+  digitalWrite(IN1,LOW);digitalWrite(IN2,HIGH);
+  digitalWrite(IN3,HIGH);digitalWrite(IN4,LOW);
+  analogWrite(ENA,turnSpeed);analogWrite(ENB,turnSpeed);
+}
+
+void stopMotors() {
+  analogWrite(ENA,0);analogWrite(ENB,0);
+}
+
+// Turns
+void doTurnLeft(){unsigned long t=millis();while(millis()-t<800){pivotLeftMotors();readSensors();if(onCenter)break;}stopMotors();moveForward(slowSpeed,slowSpeed);delay(TURN_FORWARD_TIME);}
+void doTurnRight(){unsigned long t=millis();while(millis()-t<800){pivotRightMotors();readSensors();if(onCenter)break;}stopMotors();moveForward(slowSpeed,slowSpeed);delay(TURN_FORWARD_TIME);}
+void doUTurn(){unsigned long t=millis();while(millis()-t<1200){pivotRightMotors();readSensors();if(onCenter)break;}stopMotors();moveForward(slowSpeed,slowSpeed);delay(200);}
+
+// Recovery
+void recoverLine(){
+  unsigned long t=millis();
+  while(millis()-t<200){pivotRightMotors();readSensors();if(onCenter)return;}
+  t=millis();
+  while(millis()-t<400){pivotLeftMotors();readSensors();if(onCenter)return;}
+  stopMotors();
+}

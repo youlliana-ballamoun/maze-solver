@@ -152,7 +152,7 @@ def get_logs():
 
 @app.route("/status")
 def status():
-    # 🔥 SIMPLE REAL CONNECTION = PORT OPEN ONLY
+    # REAL CONNECTION = PORT OPEN 
     return jsonify({
         "connected": bt is not None and bt.is_open
     })
